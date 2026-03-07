@@ -11,15 +11,13 @@ st.title("Market Overview 📊")
 
 @st.cache_data(ttl=600)
 def load_data(symbol):
-    session = db.get_session()
-    try:
-        query = text(
-            "SELECT * FROM market_data WHERE symbol = :symbol ORDER BY date ASC"
-        )
-        df = pd.read_sql(query, session.bind, params={'symbol': symbol})
-        return df
-    finally:
-        session.close()
+    query = text(
+        "SELECT * FROM market_data WHERE symbol = :symbol ORDER BY date ASC"
+    )
+    with db.engine.connect() as conn:
+        result = conn.execute(query, {'symbol': symbol})
+        df = pd.DataFrame(result.fetchall(), columns=result.keys())
+    return df
 
 # Sidebar controls
 st.sidebar.header("Filter Options")
