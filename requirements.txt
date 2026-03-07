@@ -1,0 +1,12 @@
+python-dotenv
+pandas
+sqlalchemy
+psycopg2-binary
+streamlit
+requests
+beautifulsoup4
+yfinance
+fear-and-greed
+plotly
+schedule
+pytest
