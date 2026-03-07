@@ -1,22 +1,9 @@
-import os
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
-from dotenv import load_dotenv
-import finlab
-from finlab import data as finlab_data
-
-load_dotenv()
 
 st.set_page_config(page_title="Market Indicators", page_icon="📊", layout="wide")
-
-@st.cache_resource
-def init_finlab():
-    api_key = os.getenv("FINLAB_API_KEY", "")
-    finlab.login(api_key)
-
-init_finlab()
 
 st.title("📊 Market Indicators Dashboard")
 
@@ -66,23 +53,40 @@ def get_vix_current():
     except:
         return None
 
-@st.cache_data(ttl=600)
-def get_taiwan_hv(start, end):
-    """用加權指數日報酬計算 30 日歷史波動率（年化），作為台灣 VIX 代理"""
+@st.cache_data(ttl=60)
+def get_taiwan_vix():
+    """從 TAIFEX MIS 取得台灣 VIX（臺指波動率指數）即時數值"""
     try:
-        close = finlab_data.get('price:收盤價')
-        # 取大盤近兩年資料算波動率
-        twii = close.get('0050', None)
-        if twii is None:
-            return pd.DataFrame()
-        twii = twii.dropna()
-        ret = twii.pct_change().dropna()
-        hv = ret.rolling(30).std() * (252 ** 0.5) * 100  # 年化，轉成%
-        df = pd.DataFrame({'date': hv.index.date, 'value': hv.values}).dropna()
-        df = df[(df['date'] >= start) & (df['date'] <= end)]
-        return df.reset_index(drop=True)
+        import requests
+        r = requests.post(
+            'https://mis.taifex.com.tw/futures/api/getQuoteListVIX',
+            json={},
+            headers={
+                'User-Agent': 'Mozilla/5.0',
+                'Content-Type': 'application/json',
+                'Referer': 'https://mis.taifex.com.tw/futures/VolatilityQuotes/',
+            },
+            timeout=10
+        )
+        d = r.json()
+        quotes = d.get('RtData', {}).get('QuoteList', [])
+        if quotes:
+            q = quotes[0]
+            val = float(q.get('CLastPrice', 0))
+            diff = float(q.get('CDiff', 0))
+            diff_rate = float(q.get('CDiffRate', 0)) * 100
+            ref = float(q.get('CRefPrice', val))
+            return {
+                'value': val, 'change': diff, 'pct': diff_rate,
+                'ref': ref,
+                'open': q.get('COpenPrice', '-'),
+                'high': q.get('CHighPrice', '-'),
+                'low': q.get('CLowPrice', '-'),
+                'date': q.get('CDate', ''),
+            }
     except Exception:
-        return pd.DataFrame()
+        pass
+    return None
 
 col_vix1, col_vix2 = st.columns(2)
 
@@ -122,40 +126,49 @@ with col_vix1:
         st.error(f"Error loading US VIX: {e}")
 
 with col_vix2:
-    st.subheader("🇹🇼 台灣歷史波動率 (30D HV)")
+    st.subheader("🇹🇼 台灣 VIX（臺指波動率指數）")
     try:
-        df_tw_hv = get_taiwan_hv(start_date, end_date)
+        tw_vix = get_taiwan_vix()
 
-        if not df_tw_hv.empty:
-            curr_hv = round(df_tw_hv['value'].iloc[-1], 2)
-            prev_hv = round(df_tw_hv['value'].iloc[-2], 2) if len(df_tw_hv) > 1 else curr_hv
-            hv_change = round(curr_hv - prev_hv, 2)
-            hv_pct = round(hv_change / prev_hv * 100, 2) if prev_hv else 0
-            tw_status = "Low (<15%)" if curr_hv < 15 else ("Medium (15-25%)" if curr_hv < 25 else "High (>25%)")
+        if tw_vix:
+            val = tw_vix['value']
+            change = tw_vix['change']
+            pct = tw_vix['pct']
+            tw_status = "Low (<20)" if val < 20 else ("Medium (20-30)" if val < 30 else "High (>30)")
 
             c1, c2, c3 = st.columns(3)
-            c1.metric("HV30", f"{curr_hv:.2f}%", f"{hv_change:+.2f} ({hv_pct:+.2f}%)")
-            c2.metric("前日", f"{prev_hv:.2f}%")
+            c1.metric("TVIX", f"{val:.2f}", f"{change:+.2f} ({pct:+.2f}%)")
+            c2.metric("昨收", f"{tw_vix['ref']:.2f}")
             c3.metric("狀態", tw_status)
 
-            fig2 = go.Figure()
-            fig2.add_trace(go.Scatter(
-                x=df_tw_hv['date'], y=df_tw_hv['value'],
-                mode='lines', name='TW HV30', line=dict(color='orange', width=2),
-                fill='tozeroy', fillcolor='rgba(255,165,0,0.1)'
+            col_ohlv1, col_ohlv2, col_ohlv3 = st.columns(3)
+            col_ohlv1.metric("開盤", tw_vix['open'])
+            col_ohlv2.metric("最高", tw_vix['high'])
+            col_ohlv3.metric("最低", tw_vix['low'])
+
+            fig2 = go.Figure(go.Indicator(
+                mode="gauge+number+delta",
+                value=val,
+                delta={'reference': tw_vix['ref'], 'valueformat': '.2f'},
+                title={'text': "臺指波動率指數 TVIX", 'font': {'size': 16}},
+                gauge={
+                    'axis': {'range': [0, 60]},
+                    'bar': {'color': 'orange'},
+                    'steps': [
+                        {'range': [0, 20], 'color': 'rgba(0,200,0,0.2)'},
+                        {'range': [20, 30], 'color': 'rgba(255,165,0,0.2)'},
+                        {'range': [30, 60], 'color': 'rgba(255,0,0,0.2)'},
+                    ],
+                    'threshold': {'line': {'color': 'white', 'width': 3}, 'thickness': 0.75, 'value': val}
+                }
             ))
-            fig2.add_hline(y=15, line_dash="dash", line_color="orange", annotation_text="15%")
-            fig2.add_hline(y=25, line_dash="dash", line_color="red", annotation_text="25%")
-            fig2.update_layout(
-                yaxis_title="波動率 (%)", template="plotly_dark",
-                height=320, hovermode='x unified', margin=dict(t=10)
-            )
+            fig2.update_layout(template="plotly_dark", height=320, margin=dict(t=10))
             st.plotly_chart(fig2, use_container_width=True)
-            st.caption("以 0050 ETF 30 日滾動報酬標準差年化計算，作為台灣市場波動率參考")
+            st.caption("資料來源：TAIFEX MIS 即時報價，每分鐘更新")
         else:
-            st.warning("無法取得台灣波動率資料")
+            st.warning("無法取得台灣 VIX 資料（非交易時段）")
     except Exception as e:
-        st.error(f"Error loading TW HV: {e}")
+        st.error(f"Error loading TW VIX: {e}")
 
 # ── 2. Fear & Greed ─────────────────────────────────────────────────────────
 st.header("😨 CNN Fear & Greed Index")
@@ -301,6 +314,17 @@ if vix_now_val:
         '狀態': vix_status,
         '更新時間': datetime.now().strftime('%Y-%m-%d %H:%M')
     })
+tw_vix_summary = get_taiwan_vix()
+if tw_vix_summary:
+    tv = tw_vix_summary['value']
+    tv_status = "Low" if tv < 20 else ("Medium" if tv < 30 else "High")
+    summary.append({
+        '指標': 'TW VIX (TVIX)',
+        '數值': f"{tv:.2f}",
+        '漲跌': f"{tw_vix_summary['change']:+.2f} ({tw_vix_summary['pct']:+.2f}%)",
+        '狀態': tv_status,
+        '更新時間': datetime.now().strftime('%Y-%m-%d %H:%M')
+    })
 if fg:
     summary.append({'指標': 'Fear & Greed', '數值': f"{fg['value']:.0f}", '漲跌': '-', '狀態': fg['description'], '更新時間': datetime.now().strftime('%Y-%m-%d %H:%M')})
 if margin is not None:
@@ -309,4 +333,4 @@ if margin is not None:
 if summary:
     st.dataframe(pd.DataFrame(summary), use_container_width=True, hide_index=True)
 
-st.info("💡 資料每 10–30 分鐘自動更新。資料來源：Yahoo Finance、CNN、TWSE。")
+st.info("💡 資料來源：US VIX (CBOE)、台灣 VIX (TAIFEX MIS)、CNN Fear & Greed、TWSE。台灣 VIX 每分鐘更新，其他每 10–30 分鐘更新。")
