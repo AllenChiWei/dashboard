@@ -11,3 +11,5 @@ plotly
 schedule
 pytest
 finlab
+# AI Agents
+anthropic
