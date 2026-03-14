@@ -96,7 +96,12 @@ def get_taiwan_vix():
         quotes = r.json().get('RtData', {}).get('QuoteList', [])
         if quotes:
             q = quotes[0]
-            val = float(q.get('CLastPrice', 0))
+            try:
+                val = float(q.get('CLastPrice', 0))
+            except (ValueError, TypeError):
+                val = 0.0
+            if val <= 0:
+                return None   # market closed or stale
             ref = float(q.get('CRefPrice', val))
             return {
                 'value': val,
@@ -144,30 +149,37 @@ def get_fear_greed_history(start):
 
 @st.cache_data(ttl=3600)
 def get_margin_maintenance_ratio():
-    """大盤融資維持率 = Σ(融資股數 × 股價) / 大盤融資餘額"""
+    """大盤融資維持率 = Σ(融資股數 × 股價) / 大盤融資餘額
+
+    TWSE OpenAPI always returns the latest trading day (D').
+    FinMind may lag by one day (D = D' - 1).
+    When dates match → use 今日餘額 (D' balance, same as FinMind date).
+    When FinMind lags → use 前日餘額 (D balance, same as FinMind date)
+    so that the margin quantity and denominator are from the same day.
+    Closing prices will still be D' (unavoidable from TWSE OpenAPI).
+    """
     try:
+        # ── 1. Stock closing prices (latest trading day D') ───────────────────
         r1 = requests.get('https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL', timeout=15)
         prices = {}
+        twse_date_raw = ''
         for item in r1.json():
             try:
                 prices[str(item.get('Code', '')).strip()] = float(
                     str(item.get('ClosingPrice', '0')).replace(',', '')
                 )
+                if not twse_date_raw:
+                    twse_date_raw = item.get('Date', '')   # e.g. "1150310" (ROC)
             except Exception:
                 pass
 
-        r2 = requests.get('https://openapi.twse.com.tw/v1/exchangeReport/MI_MARGN', timeout=15)
-        margin_rows = r2.json()
-        if not margin_rows:
-            return None
+        # Convert ROC date "1150310" → "2026-03-10"
+        twse_date = ''
+        if len(twse_date_raw) == 7:
+            roc_y = int(twse_date_raw[:3])
+            twse_date = f'{roc_y + 1911}-{twse_date_raw[3:5]}-{twse_date_raw[5:]}'
 
-        keys = list(margin_rows[0].keys())
-        code_key = keys[0]
-        balance_key = next(
-            (k for k in keys if '今日餘額' in k or ('餘額' in k and '融資' in k)),
-            keys[3] if len(keys) > 3 else keys[1]
-        )
-
+        # ── 2. FinMind aggregate margin money (denominator) ───────────────────
         start_dt = (datetime.now() - timedelta(days=10)).strftime('%Y-%m-%d')
         r3 = requests.get(
             'https://api.finmindtrade.com/api/v4/data',
@@ -177,10 +189,30 @@ def get_margin_maintenance_ratio():
         money_rows = [x for x in r3.json().get('data', []) if x.get('name') == 'MarginPurchaseMoney']
         if not money_rows:
             return None
+        finmind_date = money_rows[-1].get('date', '')   # e.g. "2026-03-09"
         denominator = float(money_rows[-1]['TodayBalance'])
         if denominator == 0:
             return None
 
+        # ── 3. MI_MARGN margin share balance ─────────────────────────────────
+        r2 = requests.get('https://openapi.twse.com.tw/v1/exchangeReport/MI_MARGN', timeout=15)
+        margin_rows = r2.json()
+        if not margin_rows:
+            return None
+
+        keys = list(margin_rows[0].keys())
+        code_key = keys[0]
+        # keys[5] = 前日餘額 (previous-day balance = D' - 1)
+        # keys[6] = 今日餘額 (current-day balance  = D')
+        today_key = next((k for k in keys if '今日餘額' in k), keys[6] if len(keys) > 6 else keys[3])
+        prev_key  = next((k for k in keys if '前日餘額' in k), keys[5] if len(keys) > 5 else keys[3])
+
+        # Use previous-day balance when FinMind date is older than TWSE date
+        # so balance and denominator refer to the same trading day.
+        date_aligned = (finmind_date == twse_date)
+        balance_key = today_key if date_aligned else prev_key
+
+        # ── 4. Compute numerator = Σ(lots × 1000 shares × price) ─────────────
         numerator = 0.0
         for item in margin_rows:
             try:
@@ -190,11 +222,15 @@ def get_margin_maintenance_ratio():
             except Exception:
                 pass
 
+        balance_date = twse_date if date_aligned else finmind_date
         return {
             'ratio': numerator / denominator * 100,
             'numerator': numerator,
             'denominator': denominator,
-            'date': money_rows[-1].get('date', ''),
+            'date': finmind_date,           # denominator date
+            'balance_date': balance_date,   # balance date
+            'twse_date': twse_date,
+            'date_aligned': date_aligned,
         }
     except Exception:
         return None
@@ -221,6 +257,190 @@ def get_margin_history(start):
         return money[['date', 'value']].sort_values('date').reset_index(drop=True)
     except Exception:
         return pd.DataFrame()
+
+
+@st.cache_data(ttl=3600)
+def get_margin_ratio_history(n_trading_days: int = 30):
+    """Fetch official aggregate 大盤融資維持率 from TWSE web API.
+
+    Calls TWSE MI_MARGN for each recent trading day and extracts the
+    aggregate maintenance ratio from the response's totals row.
+    Returns DataFrame with columns: date (date), ratio (float%).
+
+    Reference values (2026):
+        3/9 = 153.81%  3/10 = 158.11%  3/11 = 166.13%  3/12 = 164.60%
+    """
+    import time
+
+    results = []
+    dt = datetime.now()
+    consecutive_miss = 0
+
+    while len(results) < n_trading_days and consecutive_miss < 7:
+        if dt.weekday() >= 5:          # skip weekends
+            dt -= timedelta(days=1)
+            continue
+
+        date_str = dt.strftime('%Y%m%d')
+        fetched = False
+        for url in [
+            'https://www.twse.com.tw/rwd/zh/marginShortselling/MI_MARGN',
+            'https://www.twse.com.tw/exchangeReport/MI_MARGN',
+        ]:
+            try:
+                r = requests.get(
+                    url,
+                    params={'date': date_str, 'selectType': 'ALL', 'response': 'json'},
+                    headers={'User-Agent': 'Mozilla/5.0'},
+                    timeout=10,
+                )
+                payload = r.json()
+                if payload.get('stat') != 'OK':
+                    continue
+                fields = payload.get('fields', [])
+                total  = payload.get('total', [])
+                if not total:
+                    continue
+                # Find 融資維持率 column index
+                ratio_idx = next(
+                    (i for i, f in enumerate(fields) if '維持率' in str(f)),
+                    len(total) - 1   # fallback: last column
+                )
+                if ratio_idx < len(total):
+                    val_str = str(total[ratio_idx]).replace(',', '').replace('%', '').strip()
+                    try:
+                        results.append({'date': dt.date(), 'ratio': float(val_str)})
+                        consecutive_miss = 0
+                        fetched = True
+                        break
+                    except ValueError:
+                        pass
+            except Exception:
+                pass
+
+        if not fetched:
+            consecutive_miss += 1
+
+        dt -= timedelta(days=1)
+        time.sleep(0.15)   # rate-limit TWSE
+
+    df = pd.DataFrame(results)
+    if not df.empty:
+        df = df.sort_values('date').reset_index(drop=True)
+    return df
+
+
+@st.cache_data(ttl=3600)
+def get_taifex_oi():
+    """Fetch TAIFEX institutional OI: P/C ratio, 外資期貨淨口數, 外資選擇權多空口數.
+
+    Endpoints (POST, CSV, cp950):
+      pcRatioDown           → P/C ratio history
+      futContractsDateDown  → futures OI by investor type
+      optContractsDateDown  → options OI by investor type
+    Row order within each date×product block: 自營商(0), 投信(1), 外資及陸資(2)
+    """
+    from datetime import timedelta
+
+    # Use yesterday as end date — today's data may not be published yet
+    # (TAIFEX returns an HTML error page if the requested date has no data)
+    today_dt = datetime.now()
+    end_dt   = today_dt - timedelta(days=1)
+    today    = end_dt.strftime('%Y/%m/%d')
+    start    = (today_dt - timedelta(days=7)).strftime('%Y/%m/%d')
+    hdrs = {
+        'User-Agent': 'Mozilla/5.0',
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Referer': 'https://www.taifex.com.tw/',
+    }
+    res = {}
+
+    # ── P/C ratio ─────────────────────────────────────────────────────────────
+    try:
+        r = requests.post('https://www.taifex.com.tw/cht/3/pcRatioDown',
+                          data={'queryStartDate': start, 'queryEndDate': today},
+                          headers=hdrs, timeout=15)
+        rows = [l.strip().split(',') for l in r.content.decode('cp950', errors='replace').strip().split('\n')
+                if l.strip() and l.strip()[0].isdigit()]
+        if rows:
+            # Data is sorted descending (newest first) in the CSV
+            last, prev = rows[0], (rows[1] if len(rows) >= 2 else None)
+            res['pc_ratio']      = float(last[6]) if len(last) > 6 and last[6] else None
+            res['pc_date']       = last[0]
+            res['pc_ratio_prev'] = float(prev[6]) if prev and len(prev) > 6 and prev[6] else None
+    except Exception:
+        pass
+
+    # ── Futures OI (外資及陸資 net lots, 台股期貨 = first 3 rows per date) ──────
+    try:
+        r = requests.post('https://www.taifex.com.tw/cht/3/futContractsDateDown',
+                          data={'queryStartDate': start, 'queryEndDate': today},
+                          headers=hdrs, timeout=15)
+        rows = [l.strip().split(',') for l in r.content.decode('cp950', errors='replace').strip().split('\n')
+                if l.strip() and l.strip()[0].isdigit()]
+        by_date = {}
+        for row in rows:
+            by_date.setdefault(row[0], []).append(row)
+        sorted_dates = sorted(by_date)
+
+        def _fut_net(date_rows):
+            # Row index 2 within each date = 外資及陸資 for first product (台股期貨)
+            if len(date_rows) >= 3 and len(date_rows[2]) >= 14:
+                try:
+                    return int(date_rows[2][13])
+                except (ValueError, IndexError):
+                    pass
+            return None
+
+        if sorted_dates:
+            res['fut_net_oi']      = _fut_net(by_date[sorted_dates[-1]])
+            res['fut_date']        = sorted_dates[-1]
+        if len(sorted_dates) >= 2:
+            res['fut_net_oi_prev'] = _fut_net(by_date[sorted_dates[-2]])
+    except Exception:
+        pass
+
+    # ── Options OI (外資及陸資 multi/空 口數, 台指選擇權 = first 3 rows per date) ─
+    try:
+        r = requests.post('https://www.taifex.com.tw/cht/3/optContractsDateDown',
+                          data={'queryStartDate': start, 'queryEndDate': today},
+                          headers=hdrs, timeout=15)
+        rows = [l.strip().split(',') for l in r.content.decode('cp950', errors='replace').strip().split('\n')
+                if l.strip() and l.strip()[0].isdigit()]
+        by_date = {}
+        for row in rows:
+            by_date.setdefault(row[0], []).append(row)
+        sorted_dates = sorted(by_date)
+
+        def _opt_oi(date_rows):
+            if len(date_rows) >= 3 and len(date_rows[2]) >= 14:
+                r = date_rows[2]
+                try:
+                    return {
+                        'long':      int(r[9]),    # 多方未平倉口數
+                        'long_val':  int(r[10]),   # 多方未平倉金額(千元)
+                        'short':     int(r[11]),   # 空方未平倉口數
+                        'short_val': int(r[12]),   # 空方未平倉金額(千元)
+                        'net':       int(r[13]),   # 淨口數
+                    }
+                except (ValueError, IndexError):
+                    pass
+            return None
+
+        if sorted_dates:
+            oi = _opt_oi(by_date[sorted_dates[-1]])
+            if oi:
+                res.update({'opt_long': oi['long'], 'opt_long_val': oi['long_val'],
+                            'opt_short': oi['short'], 'opt_short_val': oi['short_val'],
+                            'opt_net': oi['net'], 'opt_date': sorted_dates[-1]})
+        if len(sorted_dates) >= 2:
+            oi_prev = _opt_oi(by_date[sorted_dates[-2]])
+            if oi_prev:
+                res['opt_net_prev'] = oi_prev['net']
+    except Exception:
+        pass
+
+    return res
 
 
 def compute_fear_score(vix_us, tw_vix, fg_val, margin_ratio):
@@ -272,6 +492,7 @@ fg              = get_fear_greed()
 df_fg           = get_fear_greed_history(start_date)
 margin_result   = get_margin_maintenance_ratio()
 df_margin       = get_margin_history(start_date)
+taifex_oi       = get_taifex_oi()
 
 vix_val      = vix_now['value']        if vix_now       else None
 tw_vix_val   = tw_vix['value']         if tw_vix        else None
@@ -365,6 +586,123 @@ with qv4:
         ), use_container_width=True)
     else:
         st.info("融資維持率 N/A")
+
+st.divider()
+
+# ── TAIFEX 籌碼指標 Row ────────────────────────────────────────────────────────
+st.markdown("### ◈ 期權籌碼")
+
+def _alert_color(val, prev, threshold=0.25):
+    """Return CSS color: orange if change > threshold × |prev|, else normal."""
+    if val is None or prev is None or prev == 0:
+        return "#aaaaaa"
+    change_pct = abs(val - prev) / abs(prev)
+    if change_pct > threshold:
+        return "#ff6600"
+    return "#00cc88" if val >= 0 else "#ff4444"
+
+tc1, tc2, tc3, tc4, tc5 = st.columns(5)
+
+with tc1:
+    pc = taifex_oi.get('pc_ratio')
+    pc_prev = taifex_oi.get('pc_ratio_prev')
+    pc_date = taifex_oi.get('pc_date', '')
+    if pc is not None:
+        pc_delta = f"{pc - pc_prev:+.2f}" if pc_prev else ""
+        pc_color = "#ff4444" if pc > 130 else ("#00cc88" if pc < 80 else "#ffcc00")
+        st.markdown(f"""<div style="background:linear-gradient(135deg,#0d1827,#0f2236);
+            border:1px solid #1c3a58;border-left:3px solid {pc_color};
+            border-radius:4px;padding:10px 14px;text-align:center;">
+          <div style="font-family:monospace;font-size:.65rem;color:#5a90b0;letter-spacing:1px;">
+            PUT/CALL OI比率%</div>
+          <div style="font-family:monospace;font-size:1.6rem;color:{pc_color};font-weight:bold;">
+            {pc:.2f}</div>
+          <div style="font-family:monospace;font-size:.7rem;color:#888;">{pc_delta} ｜ {pc_date}</div>
+        </div>""", unsafe_allow_html=True)
+    else:
+        st.info("P/C Ratio N/A")
+
+with tc2:
+    fut_net = taifex_oi.get('fut_net_oi')
+    fut_prev = taifex_oi.get('fut_net_oi_prev')
+    fut_date = taifex_oi.get('fut_date', '')
+    if fut_net is not None:
+        fut_color = "#00cc88" if fut_net >= 0 else "#ff4444"
+        fut_delta = fut_net - fut_prev if fut_prev is not None else None
+        delta_str = f"{fut_delta:+,}" if fut_delta is not None else ""
+        alert_col = _alert_color(fut_net, fut_prev)
+        delta_color = alert_col if fut_delta is not None else "#888"
+        st.markdown(f"""<div style="background:linear-gradient(135deg,#0d1827,#0f2236);
+            border:1px solid #1c3a58;border-left:3px solid {fut_color};
+            border-radius:4px;padding:10px 14px;text-align:center;">
+          <div style="font-family:monospace;font-size:.65rem;color:#5a90b0;letter-spacing:1px;">
+            外資期貨淨口數</div>
+          <div style="font-family:monospace;font-size:1.6rem;color:{fut_color};font-weight:bold;">
+            {fut_net:,}</div>
+          <div style="font-family:monospace;font-size:.7rem;color:{delta_color};font-weight:bold;">
+            {delta_str} ｜ {fut_date}</div>
+        </div>""", unsafe_allow_html=True)
+    else:
+        st.info("外資期貨 N/A")
+
+with tc3:
+    opt_long = taifex_oi.get('opt_long')
+    opt_long_val = taifex_oi.get('opt_long_val')
+    opt_date = taifex_oi.get('opt_date', '')
+    if opt_long is not None:
+        long_val_b = f"{opt_long_val/1e5:.1f}億" if opt_long_val else ""
+        st.markdown(f"""<div style="background:linear-gradient(135deg,#0d1827,#0f2236);
+            border:1px solid #1c3a58;border-left:3px solid #00bfff;
+            border-radius:4px;padding:10px 14px;text-align:center;">
+          <div style="font-family:monospace;font-size:.65rem;color:#5a90b0;letter-spacing:1px;">
+            外資選擇權多方OI</div>
+          <div style="font-family:monospace;font-size:1.6rem;color:#00bfff;font-weight:bold;">
+            {opt_long:,}</div>
+          <div style="font-family:monospace;font-size:.7rem;color:#888;">{long_val_b} ｜ {opt_date}</div>
+        </div>""", unsafe_allow_html=True)
+    else:
+        st.info("選擇權多方 N/A")
+
+with tc4:
+    opt_short = taifex_oi.get('opt_short')
+    opt_short_val = taifex_oi.get('opt_short_val')
+    if opt_short is not None:
+        short_val_b = f"{opt_short_val/1e5:.1f}億" if opt_short_val else ""
+        st.markdown(f"""<div style="background:linear-gradient(135deg,#0d1827,#0f2236);
+            border:1px solid #1c3a58;border-left:3px solid #ff9900;
+            border-radius:4px;padding:10px 14px;text-align:center;">
+          <div style="font-family:monospace;font-size:.65rem;color:#5a90b0;letter-spacing:1px;">
+            外資選擇權空方OI</div>
+          <div style="font-family:monospace;font-size:1.6rem;color:#ff9900;font-weight:bold;">
+            {opt_short:,}</div>
+          <div style="font-family:monospace;font-size:.7rem;color:#888;">{short_val_b}</div>
+        </div>""", unsafe_allow_html=True)
+    else:
+        st.info("選擇權空方 N/A")
+
+with tc5:
+    opt_net = taifex_oi.get('opt_net')
+    opt_net_prev = taifex_oi.get('opt_net_prev')
+    if opt_net is not None:
+        opt_color = "#00cc88" if opt_net >= 0 else "#ff4444"
+        opt_delta = opt_net - opt_net_prev if opt_net_prev is not None else None
+        delta_str = f"{opt_delta:+,}" if opt_delta is not None else ""
+        alert_col = _alert_color(opt_net, opt_net_prev)
+        delta_color = alert_col if opt_delta is not None else "#888"
+        st.markdown(f"""<div style="background:linear-gradient(135deg,#0d1827,#0f2236);
+            border:1px solid #1c3a58;border-left:3px solid {opt_color};
+            border-radius:4px;padding:10px 14px;text-align:center;">
+          <div style="font-family:monospace;font-size:.65rem;color:#5a90b0;letter-spacing:1px;">
+            外資選擇權淨口數</div>
+          <div style="font-family:monospace;font-size:1.6rem;color:{opt_color};font-weight:bold;">
+            {opt_net:,}</div>
+          <div style="font-family:monospace;font-size:.7rem;color:{delta_color};font-weight:bold;">
+            {delta_str}</div>
+        </div>""", unsafe_allow_html=True)
+    else:
+        st.info("選擇權淨口數 N/A")
+
+st.caption("TAIFEX · P/C比率(成交量基準) · 外資及陸資台股期貨未平倉淨口數 · 台指選擇權外資多空口數 · 每小時更新")
 
 st.divider()
 
@@ -572,28 +910,55 @@ with r2c2:
         m1, m2, m3 = st.columns(3)
         m1.metric("維持率", f"{ratio:.1f}%", m_risk)
         m2.metric("融資市值", f"{margin_result['numerator'] / 1e8:.0f}億")
-        m3.metric("融資餘額", f"{margin_result['denominator'] / 1e8:.0f}億")
+        m3.metric("融資餘額", f"{margin_result['denominator'] / 1e8:.1f}億")
+        if not margin_result.get('date_aligned', True):
+            st.caption(
+                f"⚠️ 股價資料({margin_result.get('twse_date','')}) "
+                f"與融資餘額資料({margin_result.get('date','')}) 日期差一天，"
+                f"比率為估算值。"
+            )
 
-        if not df_margin.empty:
+        df_ratio_hist = get_margin_ratio_history(30)
+        if not df_ratio_hist.empty:
+            fig_m = go.Figure()
+            fig_m.add_trace(go.Scatter(
+                x=df_ratio_hist['date'], y=df_ratio_hist['ratio'],
+                mode='lines+markers', name='融資維持率',
+                line=dict(color='#00aaff', width=2),
+                marker=dict(size=5),
+                fill='tozeroy', fillcolor='rgba(0,170,255,0.07)',
+                hovertemplate='%{x|%Y-%m-%d}  %{y:.2f}%<extra></extra>',
+            ))
+            # Reference lines
+            fig_m.add_hline(y=130, line_dash="dash", line_color="#ff2222",
+                            annotation_text="130% 危險", annotation_font_color="#ff2222")
+            fig_m.add_hline(y=166, line_dash="dot", line_color="#00bfff",
+                            annotation_text="166% 中性", annotation_font_color="#00bfff")
+            # Today's computed value as a marker
+            fig_m.add_hline(
+                y=ratio, line_dash="dot", line_color="#ffcc00",
+                annotation_text=f"今日 {ratio:.2f}%",
+                annotation_font_color="#ffcc00",
+            )
+            fig_m.update_layout(**LINE_LAYOUT, yaxis_title="融資維持率 (%)")
+            st.plotly_chart(fig_m, use_container_width=True)
+            st.caption(
+                f"TWSE 官方數據 · 今日計算值 {ratio:.2f}%"
+                f"（{margin_result.get('balance_date', margin_result['date'])}）· 每小時更新"
+            )
+        elif not df_margin.empty:
+            # Fallback: show balance trend if TWSE API unavailable
             fig_m = go.Figure()
             fig_m.add_trace(go.Scatter(
                 x=df_margin['date'], y=df_margin['value'],
-                mode='lines', name='融資餘額',
+                mode='lines', name='融資餘額(億)',
                 line=dict(color='#00aaff', width=2),
                 fill='tozeroy', fillcolor='rgba(0,170,255,0.07)',
             ))
-            # Mark today's denominator value
-            today_val = margin_result['denominator'] / 1e8
-            fig_m.add_hline(
-                y=today_val, line_dash="dot", line_color="#ffcc00",
-                annotation_text=f"今日 {today_val:.0f}億",
-                annotation_font_color="#ffcc00",
-            )
             fig_m.update_layout(**LINE_LAYOUT, yaxis_title="融資餘額 (億元)")
             st.plotly_chart(fig_m, use_container_width=True)
-            st.caption(f"TWSE × FinMind · {margin_result['date']} · 每小時更新")
+            st.caption(f"TWSE × FinMind（備用：顯示融資餘額）· {margin_result['date']}")
         else:
-            # Fallback: gauge when no history
             fig_m_g = go.Figure(go.Indicator(
                 mode="gauge+number",
                 value=ratio,

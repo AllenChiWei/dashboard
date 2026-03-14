@@ -127,16 +127,13 @@ def _get_margin_ratio():
                 )
             except Exception:
                 pass
-        r2 = requests.get('https://openapi.twse.com.tw/v1/exchangeReport/MI_MARGN', timeout=15)
-        margin_rows = r2.json()
-        if not margin_rows:
-            return None
-        keys = list(margin_rows[0].keys())
-        code_key = keys[0]
-        balance_key = next(
-            (k for k in keys if '今日餘額' in k or ('餘額' in k and '融資' in k)),
-            keys[3] if len(keys) > 3 else keys[1]
-        )
+        twse_date_raw = ''
+        for item in r1.json()[:1]:
+            twse_date_raw = item.get('Date', '')
+        twse_date = ''
+        if len(twse_date_raw) == 7:
+            twse_date = f'{int(twse_date_raw[:3]) + 1911}-{twse_date_raw[3:5]}-{twse_date_raw[5:]}'
+
         start_dt = (datetime.now() - timedelta(days=10)).strftime('%Y-%m-%d')
         r3 = requests.get(
             'https://api.finmindtrade.com/api/v4/data',
@@ -146,9 +143,21 @@ def _get_margin_ratio():
         money_rows = [x for x in r3.json().get('data', []) if x.get('name') == 'MarginPurchaseMoney']
         if not money_rows:
             return None
+        finmind_date = money_rows[-1].get('date', '')
         denominator = float(money_rows[-1]['TodayBalance'])
         if denominator == 0:
             return None
+
+        r2 = requests.get('https://openapi.twse.com.tw/v1/exchangeReport/MI_MARGN', timeout=15)
+        margin_rows = r2.json()
+        if not margin_rows:
+            return None
+        keys = list(margin_rows[0].keys())
+        code_key = keys[0]
+        today_key = next((k for k in keys if '今日餘額' in k), keys[6] if len(keys) > 6 else keys[3])
+        prev_key  = next((k for k in keys if '前日餘額' in k), keys[5] if len(keys) > 5 else keys[3])
+        balance_key = today_key if (finmind_date == twse_date) else prev_key
+
         numerator = 0.0
         for item in margin_rows:
             try:
