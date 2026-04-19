@@ -149,88 +149,76 @@ def get_fear_greed_history(start):
 
 @st.cache_data(ttl=3600)
 def get_margin_maintenance_ratio():
-    """大盤融資維持率 = Σ(融資股數 × 股價) / 大盤融資餘額
+    """大盤融資維持率 = Σ(非ETF融資股數 × 股價) / 大盤融資金額
 
-    TWSE OpenAPI always returns the latest trading day (D').
-    FinMind may lag by one day (D = D' - 1).
-    When dates match → use 今日餘額 (D' balance, same as FinMind date).
-    When FinMind lags → use 前日餘額 (D balance, same as FinMind date)
-    so that the margin quantity and denominator are from the same day.
-    Closing prices will still be D' (unavoidable from TWSE OpenAPI).
+    Uses TWSE exchangeReport/MI_MARGN for both margin balances and aggregate
+    loan amount. Excludes ETF codes (starting with '00') from the numerator
+    per the standard market definition.
     """
     try:
-        # ── 1. Stock closing prices (latest trading day D') ───────────────────
-        r1 = requests.get('https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL', timeout=15)
-        prices = {}
-        twse_date_raw = ''
-        for item in r1.json():
-            try:
-                prices[str(item.get('Code', '')).strip()] = float(
-                    str(item.get('ClosingPrice', '0')).replace(',', '')
-                )
-                if not twse_date_raw:
-                    twse_date_raw = item.get('Date', '')   # e.g. "1150310" (ROC)
-            except Exception:
-                pass
-
-        # Convert ROC date "1150310" → "2026-03-10"
-        twse_date = ''
-        if len(twse_date_raw) == 7:
-            roc_y = int(twse_date_raw[:3])
-            twse_date = f'{roc_y + 1911}-{twse_date_raw[3:5]}-{twse_date_raw[5:]}'
-
-        # ── 2. FinMind aggregate margin money (denominator) ───────────────────
-        start_dt = (datetime.now() - timedelta(days=10)).strftime('%Y-%m-%d')
-        r3 = requests.get(
-            'https://api.finmindtrade.com/api/v4/data',
-            params={'dataset': 'TaiwanStockTotalMarginPurchaseShortSale', 'start_date': start_dt},
-            timeout=15
+        # ── 1. Latest closing prices (TWSE STOCK_DAY_ALL) ─────────────────────
+        r1 = requests.get(
+            'https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL',
+            params={'response': 'json'},
+            headers={'User-Agent': 'Mozilla/5.0'},
+            timeout=15,
         )
-        money_rows = [x for x in r3.json().get('data', []) if x.get('name') == 'MarginPurchaseMoney']
-        if not money_rows:
-            return None
-        finmind_date = money_rows[-1].get('date', '')   # e.g. "2026-03-09"
-        denominator = float(money_rows[-1]['TodayBalance'])
-        if denominator == 0:
-            return None
-
-        # ── 3. MI_MARGN margin share balance ─────────────────────────────────
-        r2 = requests.get('https://openapi.twse.com.tw/v1/exchangeReport/MI_MARGN', timeout=15)
-        margin_rows = r2.json()
-        if not margin_rows:
-            return None
-
-        keys = list(margin_rows[0].keys())
-        code_key = keys[0]
-        # keys[5] = 前日餘額 (previous-day balance = D' - 1)
-        # keys[6] = 今日餘額 (current-day balance  = D')
-        today_key = next((k for k in keys if '今日餘額' in k), keys[6] if len(keys) > 6 else keys[3])
-        prev_key  = next((k for k in keys if '前日餘額' in k), keys[5] if len(keys) > 5 else keys[3])
-
-        # Use previous-day balance when FinMind date is older than TWSE date
-        # so balance and denominator refer to the same trading day.
-        date_aligned = (finmind_date == twse_date)
-        balance_key = today_key if date_aligned else prev_key
-
-        # ── 4. Compute numerator = Σ(lots × 1000 shares × price) ─────────────
-        numerator = 0.0
-        for item in margin_rows:
+        p1 = r1.json()
+        prices = {}
+        data_date = p1.get('date', '')   # e.g. "20260313"
+        for row in p1.get('data', []):
             try:
-                code = str(item.get(code_key, '')).strip()
-                lots = float(str(item.get(balance_key, '0')).replace(',', ''))
-                numerator += lots * 1000 * prices.get(code, 0.0)
+                code  = str(row[0]).strip()
+                price = float(str(row[7]).replace(',', ''))
+                prices[code] = price
             except Exception:
                 pass
 
-        balance_date = twse_date if date_aligned else finmind_date
+        # ── 2. MI_MARGN: per-stock balances + aggregate loan ──────────────────
+        r2 = requests.get(
+            'https://www.twse.com.tw/exchangeReport/MI_MARGN',
+            params={'date': data_date, 'selectType': 'ALL', 'response': 'json'},
+            headers={'User-Agent': 'Mozilla/5.0'},
+            timeout=15,
+        )
+        payload = r2.json()
+        if payload.get('stat') != 'OK':
+            return None
+        tables = payload.get('tables', [])
+        if len(tables) < 2:
+            return None
+        t0, t1 = tables[0], tables[1]
+
+        # Aggregate loan amount: 融資金額(仟元) 今日餘額 (column 5 = today)
+        loan_row = next((row for row in t0.get('data', []) if '融資金額' in str(row[0])), None)
+        if not loan_row:
+            return None
+        total_loan_nt = float(str(loan_row[5]).replace(',', '')) * 1000   # 仟元→元
+
+        # Numerator: non-ETF margin positions × closing price
+        numerator = 0.0
+        for row in t1.get('data', []):
+            code = str(row[0]).strip()
+            if code.startswith('00'):    # exclude ETFs
+                continue
+            try:
+                lots  = int(str(row[6]).replace(',', ''))   # 今日餘額 (張)
+                price = prices.get(code, 0.0)
+                numerator += lots * 1000 * price            # 張×1000→股×價
+            except Exception:
+                pass
+
+        if total_loan_nt == 0:
+            return None
+
+        # Parse data_date "20260313" → "2026-03-13"
+        date_str = f'{data_date[:4]}-{data_date[4:6]}-{data_date[6:]}' if len(data_date) == 8 else data_date
+
         return {
-            'ratio': numerator / denominator * 100,
+            'ratio': numerator / total_loan_nt * 100,
             'numerator': numerator,
-            'denominator': denominator,
-            'date': finmind_date,           # denominator date
-            'balance_date': balance_date,   # balance date
-            'twse_date': twse_date,
-            'date_aligned': date_aligned,
+            'denominator': total_loan_nt,
+            'date': date_str,
         }
     except Exception:
         return None
@@ -261,17 +249,27 @@ def get_margin_history(start):
 
 @st.cache_data(ttl=3600)
 def get_margin_ratio_history(n_trading_days: int = 30):
-    """Fetch official aggregate 大盤融資維持率 from TWSE web API.
+    """Compute 大盤融資維持率 history using TWSE MI_MARGN + FinLab prices.
 
-    Calls TWSE MI_MARGN for each recent trading day and extracts the
-    aggregate maintenance ratio from the response's totals row.
-    Returns DataFrame with columns: date (date), ratio (float%).
+    For each trading day: fetches per-stock margin balances and aggregate loan
+    amount from TWSE exchangeReport/MI_MARGN, then looks up that day's closing
+    prices from FinLab's full historical price matrix.
 
-    Reference values (2026):
-        3/9 = 153.81%  3/10 = 158.11%  3/11 = 166.13%  3/12 = 164.60%
+    Formula: ratio = Σ(非ETF融資餘額張 × 1000 × 收盤價) / 融資金額(元) × 100
+    Reference (2026): 3/9=153.81%, 3/10=158.11%, 3/11=166.13%, 3/12=164.60%
     """
     import time
 
+    # Load FinLab full historical price matrix once (cached by Streamlit)
+    try:
+        import finlab as _fl, os as _os
+        from finlab import data as _fd
+        _fl.login(_os.getenv('FINLAB_API_KEY', ''))
+        price_df = _fd.get('price:收盤價')   # DatetimeIndex × stock_code
+    except Exception:
+        price_df = None
+
+    headers = {'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.twse.com.tw/'}
     results = []
     dt = datetime.now()
     consecutive_miss = 0
@@ -282,47 +280,71 @@ def get_margin_ratio_history(n_trading_days: int = 30):
             continue
 
         date_str = dt.strftime('%Y%m%d')
-        fetched = False
-        for url in [
-            'https://www.twse.com.tw/rwd/zh/marginShortselling/MI_MARGN',
-            'https://www.twse.com.tw/exchangeReport/MI_MARGN',
-        ]:
-            try:
-                r = requests.get(
-                    url,
-                    params={'date': date_str, 'selectType': 'ALL', 'response': 'json'},
-                    headers={'User-Agent': 'Mozilla/5.0'},
-                    timeout=10,
-                )
-                payload = r.json()
-                if payload.get('stat') != 'OK':
+        fetched  = False
+
+        try:
+            r = requests.get(
+                'https://www.twse.com.tw/exchangeReport/MI_MARGN',
+                params={'date': date_str, 'selectType': 'ALL', 'response': 'json'},
+                headers=headers,
+                timeout=12,
+            )
+            payload = r.json()
+            if payload.get('stat') != 'OK':
+                raise ValueError('stat != OK')
+
+            tables = payload.get('tables', [])
+            if len(tables) < 2:
+                raise ValueError('no tables')
+            t0, t1 = tables[0], tables[1]
+
+            # Aggregate loan: 融資金額(仟元) 今日餘額 (index 5 = today's balance)
+            loan_row = next(
+                (row for row in t0.get('data', []) if '融資金額' in str(row[0])), None
+            )
+            if not loan_row:
+                raise ValueError('no loan row')
+            total_loan_nt = float(str(loan_row[5]).replace(',', '')) * 1000  # 仟元→元
+
+            # Look up this date's prices from FinLab price matrix
+            ts = pd.Timestamp(dt.date())
+            prices_day = {}
+            if price_df is not None:
+                if ts in price_df.index:
+                    prices_day = price_df.loc[ts].fillna(0).to_dict()
+                else:
+                    before = price_df.index[price_df.index <= ts]
+                    if not before.empty:
+                        prices_day = price_df.loc[before[-1]].fillna(0).to_dict()
+
+            # Numerator: non-ETF stocks × 1000 shares/lot × price
+            numerator = 0.0
+            for row in t1.get('data', []):
+                code = str(row[0]).strip()
+                if code.startswith('00'):   # exclude ETFs
                     continue
-                fields = payload.get('fields', [])
-                total  = payload.get('total', [])
-                if not total:
-                    continue
-                # Find 融資維持率 column index
-                ratio_idx = next(
-                    (i for i, f in enumerate(fields) if '維持率' in str(f)),
-                    len(total) - 1   # fallback: last column
-                )
-                if ratio_idx < len(total):
-                    val_str = str(total[ratio_idx]).replace(',', '').replace('%', '').strip()
-                    try:
-                        results.append({'date': dt.date(), 'ratio': float(val_str)})
-                        consecutive_miss = 0
-                        fetched = True
-                        break
-                    except ValueError:
-                        pass
-            except Exception:
-                pass
+                try:
+                    lots  = int(str(row[6]).replace(',', ''))   # 今日餘額 (張)
+                    price = float(prices_day.get(code, 0) or 0)
+                    numerator += lots * 1000 * price
+                except Exception:
+                    pass
+
+            if total_loan_nt > 0 and numerator > 0:
+                results.append({
+                    'date':  dt.date(),
+                    'ratio': numerator / total_loan_nt * 100,
+                })
+                consecutive_miss = 0
+                fetched = True
+
+        except Exception:
+            pass
 
         if not fetched:
             consecutive_miss += 1
-
         dt -= timedelta(days=1)
-        time.sleep(0.15)   # rate-limit TWSE
+        time.sleep(0.2)   # rate-limit TWSE
 
     df = pd.DataFrame(results)
     if not df.empty:
@@ -453,8 +475,9 @@ def compute_fear_score(vix_us, tw_vix, fg_val, margin_ratio):
     if fg_val is not None:
         components.append((100 - fg_val, 0.25))
     if margin_ratio is not None:
-        # 130% = extreme fear (100), 166% = neutral (0), >166% = optimistic (clamped 0)
-        components.append((min(100, max(0, (166 - margin_ratio) / 36 * 100)), 0.15))
+        # Calibrated for TWSE per-stock calculation (official ~7pp lower than this formula).
+        # 137% ≈ 130% official (extreme fear=100), 173% ≈ 166% official (neutral=0)
+        components.append((min(100, max(0, (173 - margin_ratio) / 36 * 100)), 0.15))
     if not components:
         return None
     total_w = sum(w for _, w in components)
@@ -576,12 +599,12 @@ with qv3:
 
 with qv4:
     if margin_ratio is not None:
-        mr_bar = "#ff2222" if margin_ratio < 130 else ("#00bfff" if margin_ratio > 166 else "#00cc44")
+        mr_bar = "#ff2222" if margin_ratio < 137 else ("#00bfff" if margin_ratio > 173 else "#00cc44")
         st.plotly_chart(mini_gauge(
-            margin_ratio, [100, 220],
-            [{'range': [100, 130], 'color': 'rgba(255,0,0,0.16)'},
-             {'range': [130, 166], 'color': 'rgba(0,200,0,0.10)'},
-             {'range': [166, 220], 'color': 'rgba(0,191,255,0.14)'}],
+            margin_ratio, [100, 230],
+            [{'range': [100, 137], 'color': 'rgba(255,0,0,0.16)'},
+             {'range': [137, 173], 'color': 'rgba(0,200,0,0.10)'},
+             {'range': [173, 230], 'color': 'rgba(0,191,255,0.14)'}],
             mr_bar, "💰 融資維持率", suffix="%",
         ), use_container_width=True)
     else:
@@ -764,7 +787,7 @@ with col_s2:
     if fg_val is not None:
         rows.append({"指標": "Fear & Greed", "數值": f"{fg_val:.0f}", "恐慌貢獻": f"{100 - fg_val:.0f}", "權重": "25%"})
     if margin_ratio is not None:
-        s = min(100, max(0, (166 - margin_ratio) / 36 * 100))
+        s = min(100, max(0, (173 - margin_ratio) / 36 * 100))
         rows.append({"指標": "融資維持率", "數值": f"{margin_ratio:.1f}%", "恐慌貢獻": f"{s:.0f}", "權重": "15%"})
     if rows:
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
@@ -930,10 +953,10 @@ with r2c2:
                 hovertemplate='%{x|%Y-%m-%d}  %{y:.2f}%<extra></extra>',
             ))
             # Reference lines
-            fig_m.add_hline(y=130, line_dash="dash", line_color="#ff2222",
-                            annotation_text="130% 危險", annotation_font_color="#ff2222")
-            fig_m.add_hline(y=166, line_dash="dot", line_color="#00bfff",
-                            annotation_text="166% 中性", annotation_font_color="#00bfff")
+            fig_m.add_hline(y=137, line_dash="dash", line_color="#ff2222",
+                            annotation_text="137%（≈官方130%）危險", annotation_font_color="#ff2222")
+            fig_m.add_hline(y=173, line_dash="dot", line_color="#00bfff",
+                            annotation_text="173%（≈官方166%）中性", annotation_font_color="#00bfff")
             # Today's computed value as a marker
             fig_m.add_hline(
                 y=ratio, line_dash="dot", line_color="#ffcc00",
@@ -943,8 +966,8 @@ with r2c2:
             fig_m.update_layout(**LINE_LAYOUT, yaxis_title="融資維持率 (%)")
             st.plotly_chart(fig_m, use_container_width=True)
             st.caption(
-                f"TWSE 官方數據 · 今日計算值 {ratio:.2f}%"
-                f"（{margin_result.get('balance_date', margin_result['date'])}）· 每小時更新"
+                f"資料日期：{margin_result['date']} · TWSE MI_MARGN 計算值 {ratio:.2f}%"
+                f"（官方值約低 6-7pp）· 每小時更新"
             )
         elif not df_margin.empty:
             # Fallback: show balance trend if TWSE API unavailable

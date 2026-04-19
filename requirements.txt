@@ -13,3 +13,6 @@ pytest
 finlab
 # AI Agents
 anthropic
+ddgs
+xlrd
+openpyxl

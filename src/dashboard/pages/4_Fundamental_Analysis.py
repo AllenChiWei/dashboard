@@ -57,8 +57,8 @@ def get_fundamentals(symbol: str):
             pass
         return pd.Series(dtype=float)
 
-    result["roe"]       = safe_get("financial_statement:股東權益報酬率")
-    result["gross"]     = safe_get("financial_statement:毛利率")
+    result["roe"]       = safe_get("fundamental_features:ROE稅後")
+    result["gross"]     = safe_get("fundamental_features:營業毛利率")
     result["eps"]       = safe_get("financial_statement:每股盈餘")
     result["revenue"]   = safe_get("monthly_revenue:當月營收")
     result["yoy"]       = safe_get("monthly_revenue:去年同月增減(%)")
@@ -106,47 +106,44 @@ def month_label(idx):
         return str(idx)[:7]
 
 # ── Summary cards (近4季 / 近6月) ─────────────────────────────────────────────
-def render_quarter_card(label, series, suffix="%", decimals=2):
+def quarter_card_html(label, series, suffix="%", decimals=2) -> str:
     s4 = last_n(series, 4)
     if s4.empty:
-        st.markdown(f"**{label}**: N/A")
-        return
+        return f"<div class='fcard'><span class='flabel'>{label}</span><br><span class='fval' style='color:#888'>N/A</span></div>"
     latest = s4.iloc[-1]
     arrow = trend_arrow(s4)
     col = color_arrow(latest)
-    quarters = " · ".join(
-        f"{quarter_label(i)}: {fmt_val(v, suffix, decimals)}"
+    quarters = "".join(
+        f"<div>{quarter_label(i)}: {fmt_val(v, suffix, decimals)}</div>"
         for i, v in s4.items()
     )
-    st.markdown(
-        f"""<div style='background:#1e2130;border-radius:8px;padding:12px 16px;margin-bottom:8px'>
-        <span style='font-size:13px;color:#aaa'>{label}</span><br>
-        <span style='font-size:22px;font-weight:700;color:{col}'>{fmt_val(latest, suffix, decimals)}</span>
-        <span style='font-size:18px;color:{col};margin-left:6px'>{arrow}</span><br>
-        <span style='font-size:11px;color:#888'>{quarters}</span>
-        </div>""",
-        unsafe_allow_html=True,
+    return (
+        f"<div class='fcard'>"
+        f"<span class='flabel'>{label}</span><br>"
+        f"<span class='fval' style='color:{col}'>{fmt_val(latest, suffix, decimals)}"
+        f"<span style='font-size:18px;margin-left:6px'>{arrow}</span></span>"
+        f"<div class='fsub'>{quarters}</div>"
+        f"</div>"
     )
 
-def render_revenue_card(rev, yoy, mom):
+
+def revenue_card_html(rev, yoy, mom) -> str:
     if rev.empty:
-        st.markdown("**營收**: N/A")
-        return
+        return "<div class='fcard'><span class='flabel'>最新月營收</span><br><span class='fval' style='color:#888'>N/A</span></div>"
     latest_rev = rev.iloc[-1]
     latest_yoy = yoy.iloc[-1] if not yoy.empty else None
     latest_mom = mom.iloc[-1] if not mom.empty else None
     yoy_col = color_arrow(latest_yoy)
     mom_col = color_arrow(latest_mom)
     rev_m = f"{latest_rev/1e8:.2f}億" if latest_rev >= 1e8 else f"{latest_rev/1e4:.2f}萬"
-    st.markdown(
-        f"""<div style='background:#1e2130;border-radius:8px;padding:12px 16px;margin-bottom:8px'>
-        <span style='font-size:13px;color:#aaa'>最新月營收</span><br>
-        <span style='font-size:22px;font-weight:700;color:#e0e0e0'>{rev_m}</span><br>
-        <span style='font-size:13px;color:{yoy_col}'>YoY {fmt_val(latest_yoy, '%')}</span>
-        &nbsp;&nbsp;
-        <span style='font-size:13px;color:{mom_col}'>MoM {fmt_val(latest_mom, '%')}</span>
-        </div>""",
-        unsafe_allow_html=True,
+    return (
+        f"<div class='fcard'>"
+        f"<span class='flabel'>最新月營收</span><br>"
+        f"<span class='fval' style='color:#e0e0e0'>{rev_m}</span><br>"
+        f"<span style='font-size:13px;color:{yoy_col}'>YoY {fmt_val(latest_yoy, '%')}</span>"
+        f"&nbsp;&nbsp;"
+        f"<span style='font-size:13px;color:{mom_col}'>MoM {fmt_val(latest_mom, '%')}</span>"
+        f"</div>"
     )
 
 # ── Chart builders ─────────────────────────────────────────────────────────────
@@ -252,7 +249,7 @@ if search_input.strip():
 if matched_code is None:
     col_search, col_select = st.columns([2, 3])
     with col_select:
-        default_idx = 0
+        default_idx = next((i for i, d in enumerate(display_list) if d.startswith("2330")), 0)
         selected_display = st.selectbox("或從清單選擇", display_list, index=default_idx)
         matched_code = selected_display.split()[0]
 
@@ -276,15 +273,35 @@ mom   = fd["mom"]
 
 # ── Summary row ───────────────────────────────────────────────────────────────
 st.markdown("### 近況一覽")
-c1, c2, c3, c4 = st.columns(4)
-with c1:
-    render_quarter_card("ROE（股東權益報酬率）", roe, suffix="%")
-with c2:
-    render_quarter_card("毛利率", gross, suffix="%")
-with c3:
-    render_quarter_card("每股盈餘 EPS", eps, suffix=" 元", decimals=2)
-with c4:
-    render_revenue_card(rev, yoy, mom)
+
+cards_html = "".join([
+    quarter_card_html("ROE（股東權益報酬率）", roe, suffix="%"),
+    quarter_card_html("毛利率", gross, suffix="%"),
+    quarter_card_html("每股盈餘 EPS", eps, suffix=" 元", decimals=2),
+    revenue_card_html(rev, yoy, mom),
+])
+st.markdown(f"""
+<style>
+.fgrid {{
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 12px;
+    align-items: stretch;
+}}
+.fcard {{
+    background: #1e2130;
+    border-radius: 8px;
+    padding: 14px 16px;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-start;
+}}
+.flabel {{ font-size: 13px; color: #aaa; margin-bottom: 4px; }}
+.fval   {{ font-size: 22px; font-weight: 700; margin: 6px 0; }}
+.fsub   {{ font-size: 11px; color: #888; margin-top: 6px; word-break: break-word; }}
+</style>
+<div class='fgrid'>{cards_html}</div>
+""", unsafe_allow_html=True)
 
 st.divider()
 
