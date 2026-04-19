@@ -56,7 +56,14 @@ Pages in `src/dashboard/pages/` are auto-routed by Streamlit (filename = route):
 | `1_Market_Overview.py` | US stock market view | yfinance + PostgreSQL |
 | `2_Financial_Indicators.py` | Real-time fear metrics | CBOE (VIX), TAIFEX MIS (TVIX), CNN, TWSE OpenAPI, FinMind |
 | `3_Taiwan_Stocks.py` | Taiwan K-line charts | FinLab |
+| `4_Fundamental_Analysis.py` | Per-stock fundamentals (EPS, P/E, revenue) | FinLab `company_basic_info`, `price:收盤價` |
 | `5_AI_Analyst.py` | AI chat with market context | `src/dashboard/agents/` + all indicators |
+| `6_ETF_Comparison.py` | ETF NAV performance comparison | FinLab price data + TWSE/web scrape for ETF list |
+| `7_Revenue_Ranking.py` | Monthly revenue YoY ranking | FinLab revenue data |
+| `8_Convertible_Bond.py` | Convertible bond data table | FinLab CB data |
+| `9_Surveillance.py` | Disposition / watch-list stocks + price chart | TWSE web scrape (BeautifulSoup) + yfinance |
+| `10_News.py` | Taiwan stock market news aggregator | RSS feeds (cnyes/yahoo/moneydj) + optional DuckDuckGo (`ddgs`) |
+| `11_Futures_PnL.py` | Futures P&L analysis from broker XLS | User-uploaded Yuanta XLS (`xlrd`); parses `.xls` trade records |
 
 ### Caching Strategy
 
