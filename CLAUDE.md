@@ -82,11 +82,12 @@ Models in `src/database/models.py`: `MarketData`, `SentimentData`, `VIXData`, `M
 
 ### AI Analyst (`src/dashboard/agents/`)
 
-- Model: `claude-opus-4-6` with `thinking={"type": "adaptive"}`
+- Model: `claude-opus-4-6` with `thinking={"type": "adaptive"}`, `MAX_TOKENS=2048`; all prompt templates live in `agents/config.py`
 - `MarketAnalyst` is a **synchronous** wrapper around the `anthropic` SDK (not the Agent SDK) — required for Streamlit compatibility
-- `analyst.analyze(context)` → blocking one-shot analysis
+- `analyst.analyze(context)` → blocking one-shot analysis (returns full text)
 - `analyst.stream(messages)` → generator for `st.write_stream()`
-- `build_context(vix, tw_vix, fg, margin_result, score, label)` → builds the structured context dict
+- `analyst.context_block(ctx)` → compact inline context string to prepend to the first user chat message
+- `build_context(vix, tw_vix, fg, margin_result, score, label)` → assembles flat string-valued dict for prompt injection
 
 ### Fear Score Formula
 
