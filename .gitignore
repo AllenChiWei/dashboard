@@ -27,6 +27,7 @@ venv/
 
 # Environment Variables
 .env
+.streamlit/secrets.toml
 
 # IDE
 .idea/
