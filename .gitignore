@@ -46,3 +46,8 @@ Thumbs.db
 
 # Claude Code local settings
 .claude/settings.local.json
+
+# Data files
+*.xls
+*.xlsx
+*.csv
