@@ -19,8 +19,11 @@ C:/Users/Master/Anaconda3/envs/dashboard/Scripts/streamlit.exe run src/dashboard
 # Check if running
 netstat -ano | findstr :8501
 
-# Run ETL pipeline manually
+# Run full ETL pipeline (market + sentiment + VIX + margin)
 C:/Users/Master/Anaconda3/envs/dashboard/python.exe src/etl/pipeline.py
+
+# Run individual ETL functions (in Python)
+# from src.etl.pipeline import run_etl, run_sentiment_etl, run_vix_etl, run_margin_etl
 
 # Run tests
 C:/Users/Master/Anaconda3/envs/dashboard/python.exe -m pytest test_crawlers.py -v
